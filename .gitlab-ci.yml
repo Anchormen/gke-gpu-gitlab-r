@@ -1,0 +1,77 @@
+stages:
+    - build
+    - test
+    - deploy
+# Build images for CPU and GPU of tensorflow using the same Dockerfile by just changing the FROM field
+image_build:
+    stage: build
+    image: docker:stable
+    script:
+        # Git is needed to reset the Dockerfile
+        - apk update && apk add --no-cache bash git
+        # Initial images to install R and Keras
+        - export IMAGE_TENSOR_CPU='tensorflow/tensorflow:1.10.0-py3'
+        - export IMAGE_TENSOR_GPU='nvcr.io/nvidia/tensorflow:18.10-py3'
+        # The name of the branch will be used as version name except master, which will be version latest
+        - export VERSION=$(echo $CI_COMMIT_REF_NAME | sed 's,.*/,,g')
+        - |
+          if [ "$VERSION" == "master" ] ; then 
+            export VERSION=latest 
+          fi
+        # Login to Dockerhub to push CPU image
+        - docker info
+        - docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}
+        - sed -i "s#IMAGE_NAME#${IMAGE_TENSOR_CPU}#g" Dockerfile
+        - docker build -t ${DOCKER_HUB_USER}/tensorflow-r:$VERSION .
+        - docker push ${DOCKER_HUB_USER}/tensorflow-r:$VERSION
+        # Login to Nvidia registry to pull the a tensorflow image for GPU
+        - docker login -u '$oauthtoken' -p ${DOCKER_REGISTRY_PASSWORD} nvcr.io
+        - git checkout -- Dockerfile
+        # Change initial image for GPU compatibility keeping the rest of the Dockerfile
+        - sed -i "s#IMAGE_NAME#${IMAGE_TENSOR_GPU}#g" Dockerfile
+        - docker build -t ${DOCKER_HUB_USER}/tensorflow-nvidia-r:$VERSION .
+        # Login to Dockerhub to push GPU image
+        - docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}
+        - docker push ${DOCKER_HUB_USER}/tensorflow-nvidia-r:$VERSION
+# Test in a CPU, only 1 epoch
+test:
+    stage: test
+    image: ${DOCKER_HUB_USER}/tensorflow-r
+    script:
+        - Rscript code-to-run.R 1
+# Deploy in a GPU and run all epochs
+deploy:
+    image: google/cloud-sdk
+    stage: deploy
+    script:
+        # Install kubectl from https://gitlab.com/gitlab-examples/kubernetes-deploy
+        - curl -L -o /usr/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/latest.txt)/bin/linux/amd64/kubectl && chmod +x /usr/bin/kubectl
+        - kubectl version --client
+        # Authorization in gcloud see https://medium.com/@gaforres/publishing-google-cloud-container-registry-images-from-gitlab-ci-23c45356ff0e
+        - echo ${GCLOUD_SERVICE_KEY} > gcloud-service-key.json
+        - gcloud auth activate-service-account --key-file gcloud-service-key.json || true    
+        # In case the the cluster was already initiated, it should be deleted
+        - gcloud --quiet container clusters delete  ${GCLOUD_CLUSTER_NAME} --zone ${GCLOUD_ZONE} --project ${GCLOUD_PROJECT} || true
+        # Create a cluster on Google Cloud with a GPU 
+        - |
+          gcloud container clusters create ${GCLOUD_CLUSTER_NAME} \
+            --project ${GCLOUD_PROJECT} \
+            --machine-type "n1-highmem-2" \
+            --accelerator "type=nvidia-tesla-v100,count=1" \
+            --image-type "UBUNTU" \
+            --num-nodes "1" \
+            --zone ${GCLOUD_ZONE} 
+        - gcloud container clusters get-credentials ${GCLOUD_CLUSTER_NAME} --zone ${GCLOUD_ZONE} --project ${GCLOUD_PROJECT}          
+        - kubectl cluster-info || true
+        # Code as configmap
+        - kubectl create configmap code-to-run --from-file=code-to-run.R --namespace=default
+        # Install drivers in all the nodes with Nvidia GPUs
+        - kubectl apply -f daemonset.yaml --namespace=kube-system # https://github.com/GoogleCloudPlatform/container-engine-accelerators/blob/master/nvidia-driver-installer/ubuntu/daemonset.yaml 
+        # Run the code as a job
+        - kubectl create -f gke-gpu-gitlab-job.yaml --namespace=default # gke-gpu-gitlab-deployment.yaml can be used for running the code interactively 
+        # Wait until the code is finished        
+        - until kubectl get jobs my-gpu-job --namespace=default -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' | grep True ; do sleep 5 ; echo "job in progress"; done;
+        # Get results        
+        - kubectl logs $(kubectl get pods --selector=job-name=my-gpu-job --output=jsonpath={.items..metadata.name} --namespace=default) --namespace=default
+        # Shut down the gcloud cluster
+        - gcloud --quiet container clusters delete  ${GCLOUD_CLUSTER_NAME} --zone ${GCLOUD_ZONE} --project ${GCLOUD_PROJECT} || true

@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-gpu-job
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+      - name: regsecret
+      containers:
+      - name: my-gpu-container             
+        image: angelsevillacamins/tensorflow-nvidia-r
+        command: ["/bin/bash", "-c", "nvidia-smi; nvcc --version; cd /code-to-run && Rscript code-to-run.R 5"]
+        volumeMounts:
+        - name: code-to-run
+          mountPath: /code-to-run
+        # At least 1 gpu is required
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+      volumes:
+      - name: code-to-run
+        configMap:
+          name: code-to-run
+      restartPolicy: Never
